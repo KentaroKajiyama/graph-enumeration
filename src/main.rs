@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use wl_isomorphism::invariant; // 1-WL hash
 use itertools::Itertools;
+mod check_statement;
 
 type MyGraph = Graph<(), (), Undirected>;
 
@@ -709,41 +710,23 @@ fn generate_plus_2_node_or_edge_graphs_pattern_2(input_path: &str, output_path: 
 }
 
 fn main() {
-  // Step 1: Generate and relabel graphs
-  let graphs_pattern_1 = generate_semitight_k5_pattern_1();
+  for part in 1..=20 {
+    let inputs = [
+      format!("graphs/semitight_K_5_pattern_1/part_{}.json", part),
+      format!("graphs/semitight_K_5_pattern_1_plus_1/part_{}.json", part),
+      format!("graphs/semitight_K_5_pattern_1_plus_2/part_{}.json", part),
+      format!("graphs/semitight_K_5_pattern_2/part_{}.json", part),
+      format!("graphs/semitight_K_5_pattern_2_plus_1/part_{}.json", part),
+      format!("graphs/semitight_K_5_pattern_2_plus_2/part_{}.json", part),
+    ];
 
-  println!("Generated {} semitight K5 pattern 1 graphs", graphs_pattern_1.len());
-
-  // Step 2: Save them into 20 split files
-  save_split_graphs("graphs/semitight_K_5_pattern_1/", &graphs_pattern_1, 20);
-
-  println!("Saved pattern 1 graphs into 20 parts.");
-
-  let graphs_pattern_2 = generate_semitight_k5_pattern_2();
-  println!("Generated {} semitight K5 pattern 2 graphs", graphs_pattern_2.len());
-  save_split_graphs("graphs/semitight_K_5_pattern_2/", &graphs_pattern_2, 20);
-  println!("Saved pattern 2 graphs into 20 parts.");
-  // Step 3: Generate +1 node/edge graphs
-  for i in 1..=20 {
-    let input_path = format!("graphs/semitight_K_5_pattern_1/part_{}.json", i);
-    let output_path = format!("graphs/semitight_K_5_pattern_1_plus_1/part_{}.json", i);
-    generate_plus_1_node_or_edge_graphs_pattern_1(&input_path, &output_path);
-  }
-  for i in 1..=20 {
-    let input_path = format!("graphs/semitight_K_5_pattern_2/part_{}.json", i);
-    let output_path = format!("graphs/semitight_K_5_pattern_2_plus_1/part_{}.json", i);
-    generate_plus_1_node_or_edge_graphs_pattern_2(&input_path, &output_path);
-  }
-  // Step 4: Generate +2 node/edge graphs
-  for i in 1..=20 {
-    let input_path = format!("graphs/semitight_K_5_pattern_1_plus_1/part_{}.json", i);
-    let output_path = format!("graphs/semitight_K_5_pattern_1_plus_2/part_{}.json", i);
-    generate_plus_2_node_or_edge_graphs_pattern_1(&input_path, &output_path);
-  }
-  for i in 1..=20 {
-    let input_path = format!("graphs/semitight_K_5_pattern_2_plus_1/part_{}.json", i);
-    let output_path = format!("graphs/semitight_K_5_pattern_2_plus_2/part_{}.json", i);
-    generate_plus_2_node_or_edge_graphs_pattern_2(&input_path, &output_path);
+    for path in &inputs {
+      // If load_graphs takes &str: use path.as_str()
+      // If it’s AsRef<Path>, you can pass path directly
+      let graphs = load_graphs(path);
+      check_statement::check_statement_t_6(&graphs, 6);
+      println!("Checked statement for {}", path);
+    }
   }
 }
 
