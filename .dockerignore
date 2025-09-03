@@ -1,0 +1,9 @@
+# まず全無視
+*
+
+# ここから必要なものだけ許可（ホワイトリスト）
+!Cargo.toml
+!Cargo.lock
+!src/**
+!build.rs
+!Dockerfile

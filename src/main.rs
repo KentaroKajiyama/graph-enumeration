@@ -1,733 +1,767 @@
-use petgraph::graph::{Graph, NodeIndex};
-use petgraph::Undirected;
-use petgraph::algo::is_isomorphic;
-use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
+use std::cmp::max;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
-use wl_isomorphism::invariant; // 1-WL hash
-use itertools::Itertools;
-mod check_statement;
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-type MyGraph = Graph<(), (), Undirected>;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+// Added for canonical labeling with colors (nauty via graph-canon)
+use petgraph::{Graph, Undirected};
+use graph_canon::canon::CanonLabeling;
 
+
+// ---- Parameters (equivalent to Python globals) ---------------------------------
+const A_DEGS: [i32; 4] = [4, 4, 3, 3];
+const INTERNAL_EDGES: usize = 7;
+
+// ---- Types ---------------------------------------------------------------------
+#[inline]
+fn popcount_u32(x: u32) -> u32 { x.count_ones() }
+
+#[derive(Clone, Debug)]
+struct CanonPair {
+    edges: Vec<(usize, usize)>,
+    colors: Vec<u32>,
+}
+
+// JSON input/output shape: Vec<Graph>, Graph = Vec<Edge>, Edge = [u, v]
 #[derive(Serialize, Deserialize)]
-struct SerializableGraph {
-  node_count: usize,
-  edges: Vec<(usize, usize)>,
+struct EdgePair(pub i64, pub i64);
+
+// ---- Utilities -----------------------------------------------------------------
+// 必ず小さい方が前に来るように正規化
+#[inline]
+fn norm_edge(u: usize, v: usize) -> (usize, usize) { if u < v { (u, v) } else { (v, u) } }
+// 集合化。重複を許さない。
+fn edges_vec_to_set(edges: &[(usize, usize)]) -> HashSet<(usize, usize)> {
+    let mut s: HashSet<(usize, usize)> = HashSet::with_capacity(edges.len());
+    for &(u, v) in edges { s.insert(norm_edge(u, v)); }
+    s
+}
+// 辺集合に含まれているのかを正規化して確認。
+fn set_contains_edge(s: &HashSet<(usize, usize)>, u: usize, v: usize) -> bool {
+    s.contains(&norm_edge(u, v))
 }
 
-fn to_petgraph(g: &SerializableGraph) -> MyGraph {
-  let mut graph = MyGraph::new_undirected();
-  let nodes: Vec<NodeIndex> = (0..g.node_count).map(|_| graph.add_node(())).collect();
-  for &(u, v) in &g.edges {
-    // Shift back to 0-indexed internally
-    graph.add_edge(nodes[u - 1], nodes[v - 1], ());
-  }
-  graph
+// ---- WL refinement used for orbit reps & canonicalization ----------------------
+
+/// Compute WL-refined color IDs and adjacency lists for vertices [0..used).
+fn wl_refine(
+    used: usize,
+    edges_set: &HashSet<(usize, usize)>,
+    colors_sig: &[u32],
+    deg: &[i32],
+) -> Vec<usize> {
+    // Build adjacency
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); used];
+    for &(u, v) in edges_set.iter() {
+        if u < used && v < used {
+            adj[u].push(v);
+            adj[v].push(u);
+        }
+    }
+
+    // Initial partition IDs keyed by (color, deg)
+    let mut color_id: BTreeMap<(u32, i32), usize> = BTreeMap::new();
+    let mut ids: Vec<usize> = Vec::with_capacity(used);
+    for v in 0..used {
+        let key = (colors_sig[v], deg[v]);
+        let len_now = color_id.len();
+        let id = *color_id.entry(key).or_insert(len_now);
+        ids.push(id);
+    }
+
+    // Refine until stable
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut palette: BTreeMap<(u32, i32, Vec<(usize, i32)>), usize> = BTreeMap::new();
+        let mut new_ids = vec![0usize; used];
+
+        for v in 0..used {
+            // histogram of neighbor ids
+            let mut hist: BTreeMap<usize, i32> = BTreeMap::new();
+            for &w in &adj[v] { *hist.entry(ids[w]).or_insert(0) += 1; }
+            let hist_vec: Vec<(usize, i32)> = hist.into_iter().collect();
+            let key = (colors_sig[v], deg[v], hist_vec);
+            let len_now = palette.len();
+            let nid = *palette.entry(key).or_insert(len_now);
+
+            new_ids[v] = nid;
+        }
+        if new_ids != ids { ids = new_ids; changed = true; }
+    }
+
+    ids
 }
 
-fn from_petgraph(graph: &MyGraph) -> SerializableGraph {
-  let edges = graph.edge_indices()
-    .map(|e| {
-      let (u, v) = graph.edge_endpoints(e).unwrap();
-      // Shift to 1-indexed for output
-      (u.index() + 1, v.index() + 1)
-    })
-    .collect();
-  SerializableGraph {
-    node_count: graph.node_count(),
-    edges,
-  }
+/// WL-based canonicalization: returns canonically ordered edges & colors.
+fn canon_label_bb_with_markers(
+    used: usize,
+    edges: &[(usize, usize)],
+    colors: &[u32],
+) -> CanonLabeling {
+    // B 頂点 0..used-1 を作成
+    let mut g: Graph<(), (), Undirected> = Graph::with_capacity(used, edges.len());
+    let b_nodes: Vec<_> = (0..used).map(|_| g.add_node(())).collect();
+    for &(u, v) in edges.iter().filter(|&&(u, v)| u < used && v < used) {
+        g.add_edge(b_nodes[u], b_nodes[v], ());
+    }
+    // 色ごとのマーカー頂点を作成し、各頂点を自色マーカーに接続
+    let mut marker: BTreeMap<u32, _> = BTreeMap::new();
+    for &c in colors.iter().take(used) {
+        marker.entry(c).or_insert_with(|| g.add_node(()));
+    }
+    for i in 0..used {
+        let m = marker[&colors[i]];
+        g.add_edge(b_nodes[i], m, ());
+    }
+    CanonLabeling::new(&g)
 }
 
-fn load_graphs(path: &str) -> Vec<MyGraph> {
-  println!("Trying to open file at: {}", path);
-  let file = File::open(path).unwrap();
-  let reader = BufReader::new(file);
-  let graphs: Vec<SerializableGraph> = serde_json::from_reader(reader).unwrap();
-  graphs.iter().map(to_petgraph).collect()
+// ---- Build signature pool from bipartite A->B edges ---------------------------
+
+fn build_sig_pool_from_bipartite(
+    k_left: usize,
+    edges_ab: &[(usize, i64)],
+) -> HashMap<u32, usize> {
+    // B id -> signature
+    let mut sig_of_b: HashMap<i64, u32> = HashMap::new();
+    for &(a, b) in edges_ab {
+        assert!(a < k_left, "A-side index {a} is out of range 0..{}", k_left - 1);
+        let entry = sig_of_b.entry(b).or_insert(0);
+        *entry |= 1u32 << (a as u32);
+    }
+
+    // Count signatures
+    let mut sig_pool: HashMap<u32, usize> = HashMap::new();
+    for &sig in sig_of_b.values() { *sig_pool.entry(sig).or_insert(0) += 1; }
+    sig_pool
 }
 
-fn save_graphs(path: &str, graphs: &[MyGraph]) {
-  use indicatif::{ProgressBar, ProgressStyle};
+// ---- Enumeration with orbit pruning -------------------------------------------
 
-  println!("Saving {} graphs to {}", graphs.len(), path);
-  let pb = ProgressBar::new(graphs.len() as u64);
-  pb.set_style(
-    ProgressStyle::with_template(
-      "[save] [{elapsed_precise}] {wide_bar:.green/white} {pos}/{len}"
-    ).unwrap()
-  );
-
-  // Serialize graph-by-graph with progress
-  let mut serializable = Vec::with_capacity(graphs.len());
-  for g in graphs {
-    serializable.push(from_petgraph(g));
-    pb.inc(1);
-  }
-  pb.finish_with_message("Finished saving graphs");
-
-  // Write to file once
-  let file = File::create(path).unwrap();
-  let writer = BufWriter::new(file);
-  serde_json::to_writer_pretty(writer, &serializable).unwrap();
+#[derive(Debug, Eq)]
+struct MemoKey {
+    label: CanonLabeling,
+    pool_key: Vec<(u32, usize)>,
+}
+impl PartialEq for MemoKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.label == other.label && self.pool_key == other.pool_key
+    }
+}
+impl Hash for MemoKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.label.hash(state);
+        for &(sig, cnt) in &self.pool_key { sig.hash(state); cnt.hash(state); }
+    }
 }
 
-fn generate_semitight_k5_pattern_1() -> Vec<MyGraph> {
-  let mut base_graph = Graph::<(), (), Undirected>::with_capacity(0, 0);
-  let mut base_nodes = HashMap::new();
-  for v in 1..=22 {
-    base_nodes.insert(v, base_graph.add_node(()));
-  }
+fn enumerate_union_internal_graphs_orbits_unified(
+    x: usize,                  // number of internal B-B edges
+    sig_pool: &HashMap<u32, usize>,
+    extra0: Option<usize>,     // additional 0000 count (default: 2x) — absorbed into supply
+    maxdeg_total: i32,         // per-B degree cap (internal degree + A-connections)
+) -> Vec<CanonPair> {
+    let zero: u32 = 0;
+    let max_slots: usize = 2 * x;
+    let extra0_final = extra0.unwrap_or(2 * x);
 
-  base_graph.extend_with_edges(&[
-    (base_nodes[&1], base_nodes[&6]),
-    (base_nodes[&1], base_nodes[&7]),
-    (base_nodes[&1], base_nodes[&8]),
-    (base_nodes[&1], base_nodes[&2]),
-  ]);
+    // 1) unify supply: signature -> count; include extra0 into signature 0
+    let mut supply: HashMap<u32, usize> = sig_pool.clone();
+    *supply.entry(zero).or_insert(0) += extra0_final;
 
-  let mut tmp_graphs = vec![];
+    // 2) results & memo per level
+    // results labels を使って重複を排除し、results を返す。これはそのまま JSON 出力に使う。
+    let mut results_labels: HashSet<CanonLabeling> = HashSet::new();
+    let mut results: Vec<CanonPair> = Vec::new();
+    let mut seen_per_level: Vec<HashSet<MemoKey>> = (0..=x).map(|_| HashSet::new()).collect();
 
-  for edges in [
-    vec![(2, 9), (2, 10), (2, 11)],
-    vec![(2, 6), (2, 9), (2, 10)],
-    vec![(2, 6), (2, 7), (2, 9)],
-    vec![(2, 6), (2, 7), (2, 8)],
-  ] {
-    let mut g = base_graph.clone();
-    let mut local_nodes = HashMap::new();
-    for v in 1..=22 {
-      local_nodes.insert(v, NodeIndex::new(base_nodes[&v].index()));
+    // 3) upper bound on future capacity
+    let max_future_cap = |
+        used_slots: usize,
+        supply: &HashMap<u32, usize>,
+    | -> i32 {
+        let remain_slots = max_slots.saturating_sub(used_slots);
+        if remain_slots == 0 { return 0; }
+        let mut caps_multiset: Vec<i32> = Vec::new();
+        for (&sig, &cnt) in supply.iter() {
+            if cnt == 0 { continue; }
+            let cap = max(0, maxdeg_total - popcount_u32(sig) as i32);
+            if cap > 0 { for _ in 0..cnt { caps_multiset.push(cap); } }
+        }
+        if caps_multiset.is_empty() { return 0; }
+        caps_multiset.sort_unstable_by(|a, b| b.cmp(a)); // desc
+        caps_multiset.into_iter().take(remain_slots).sum()
+    };
+
+    // 4) WL color refinement for active slots (like Python refine_color_classes)
+    let refine_color_classes = |
+        used_slots: usize,
+        edges_set: &HashSet<(usize, usize)>,
+        colors_sig: &[u32],
+        deg: &[i32],
+    | -> (Vec<usize>, BTreeMap<usize, Vec<usize>>) {
+        let ids = wl_refine(used_slots, edges_set, colors_sig, deg);
+        let mut classes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for v in 0..used_slots {
+            classes.entry(ids[v]).or_default().push(v);
+        }
+        (ids, classes)
+    };
+
+    // 5) pick representative pair from two WL classes
+    let pick_rep_pair = |
+        ci: &Vec<usize>,
+        cj: &Vec<usize>,
+        caps: &[i32],
+        edges_set: &HashSet<(usize, usize)>,
+    | -> Option<(usize, usize)> {
+        if std::ptr::eq(ci, cj) {
+            let mut cand: Vec<usize> = ci.iter().cloned().filter(|&i| caps[i] > 0).collect();
+            cand.sort_unstable();
+            for a in 0..cand.len() {
+                let u = cand[a];
+                for b in (a + 1)..cand.len() {
+                    let v = cand[b];
+                    if !set_contains_edge(edges_set, u, v) { return Some(norm_edge(u, v)); }
+                }
+            }
+            None
+        } else {
+            let mut cand_u: Vec<usize> = ci.iter().cloned().filter(|&i| caps[i] > 0).collect();
+            cand_u.sort_unstable();
+            let mut cand_v: Vec<usize> = cj.iter().cloned().filter(|&j| caps[j] > 0).collect();
+            cand_v.sort_unstable();
+            for &u in &cand_u {
+                for &v in &cand_v {
+                    if !set_contains_edge(edges_set, u, v) { return Some(norm_edge(u, v)); }
+                }
+            }
+            None
+        }
+    };
+
+    // 6) DFS
+    fn as_pool_key(supply: &HashMap<u32, usize>) -> Vec<(u32, usize)> {
+        let mut v: Vec<(u32, usize)> = supply.iter().map(|(&s, &c)| (s, c)).collect();
+        v.sort_unstable_by_key(|x| x.0);
+        v
     }
-    for (a, b) in edges {
-      g.add_edge(local_nodes[&a], local_nodes[&b], ());
-    }
-    tmp_graphs.push((g, local_nodes));
-  }
 
-  let mut tmp_graphs_2 = vec![];
-  for (g, local_nodes) in tmp_graphs {
-    for combo in combinations(&(6..15).collect::<Vec<_>>(), 4) {
-      let mut g2 = g.clone();
-      let ln = local_nodes.clone();
-      for &u in &combo {
-        g2.add_edge(ln[&3], ln[&u], ());
-      }
-      tmp_graphs_2.push((g2, ln));
-    }
-  }
-
-  let tmp_graphs_2: Vec<_> = tmp_graphs_2
-    .into_iter()
-    .map(|(g, _)| g)
-    .collect();
-  let tmp_graphs_2 = deduplicate_graphs(tmp_graphs_2);
-
-  let mut tmp_graphs_3 = vec![];
-  for g in tmp_graphs_2 {
-    let mut local_nodes = HashMap::new();
-    for i in 0..g.node_count() {
-      local_nodes.insert(i + 1, NodeIndex::new(i)); // assume compact relabeling hasn't happened yet
+    fn canonical_key(
+        used_slots: usize,
+        edges: &[(usize, usize)],
+        colors: &[u32],
+        supply: &HashMap<u32, usize>,
+    ) -> MemoKey {
+        let label = canon_label_bb_with_markers(used_slots, edges, colors);
+        MemoKey { label, pool_key: as_pool_key(supply) }
     }
 
-    for combo in combinations(&(6..19).collect::<Vec<_>>(), 4) {
-      let mut g2 = g.clone();
-      for &u in &combo {
-        g2.add_edge(local_nodes[&4], local_nodes[&u], ());
-      }
-      tmp_graphs_3.push((g2, local_nodes.clone()));
-    }
-  }
-
-  let tmp_graphs_3: Vec<_> = tmp_graphs_3
-    .into_iter()
-    .map(|(g, _)| g)
-    .collect();
-  let tmp_graphs_3 = deduplicate_graphs(tmp_graphs_3);
-
-  let mut tmp_graphs_4 = vec![];
-  for g in tmp_graphs_3 {
-    let mut local_nodes = HashMap::new();
-    for i in 0..g.node_count() {
-      local_nodes.insert(i + 1, NodeIndex::new(i)); // same assumption
+    fn maybe_push_result(
+        used_slots: usize,
+        edges: &[(usize, usize)],
+        colors: &[u32],
+        results_labels: &mut HashSet<CanonLabeling>,
+        results: &mut Vec<CanonPair>,
+    ) {
+        let label = canon_label_bb_with_markers(used_slots, edges, colors);
+        if results_labels.insert(label) {
+            // 生の (edges, colors) をそのまま保持（正準表示は不要）
+            results.push(CanonPair { edges: edges.to_vec(), colors: colors.to_vec() });
+        }
     }
 
-    for combo in combinations(&(6..23).collect::<Vec<_>>(), 4) {
-      if combo.iter().any(|&u| [6, 7, 8, 9].contains(&u) && g.edges(local_nodes[&u]).count() >= 4) {
-        continue;
-      }
-      let mut g2 = g.clone();
-      for &u in &combo {
-        g2.add_edge(local_nodes[&5], local_nodes[&u], ());
-      }
-      tmp_graphs_4.push((g2, local_nodes.clone()));
+    // capture by mutable references
+    fn dfs(
+        x: usize,
+        max_slots: usize,
+        maxdeg_total: i32,
+        edges: &mut Vec<(usize, usize)>,
+        colors_sig: &mut Vec<u32>,
+        caps: &mut Vec<i32>,
+        deg: &mut Vec<i32>,
+        used_slots: usize,
+        supply: &mut HashMap<u32, usize>,
+        edges_used: usize,
+        results_labels: &mut HashSet<CanonLabeling>,
+        results: &mut Vec<CanonPair>,
+        seen_per_level: &mut [HashSet<MemoKey>],
+        max_future_cap: &dyn Fn(usize, &HashMap<u32, usize>) -> i32,
+        refine_color_classes: &dyn Fn(usize, &HashSet<(usize, usize)>, &[u32], &[i32]) -> (Vec<usize>, BTreeMap<usize, Vec<usize>>),
+        pick_rep_pair: &dyn Fn(&Vec<usize>, &Vec<usize>, &[i32], &HashSet<(usize, usize)>) -> Option<(usize, usize)>,
+    ) {
+        // Upper-bound pruning
+        let cap_active: i32 = caps.iter().take(used_slots).sum();
+        let cap_total = cap_active + max_future_cap(used_slots, supply);
+        if cap_total / 2 < (x as i32 - edges_used as i32) { return; }
+
+        // Level memoization (canonical edges + supply vector)
+        let edges_set = edges_vec_to_set(edges);
+        let key = canonical_key(used_slots, edges, colors_sig, supply);
+        if seen_per_level[edges_used].contains(&key) { return; }
+        seen_per_level[edges_used].insert(key);
+
+        // Target reached
+        if edges_used == x {
+            maybe_push_result(used_slots, edges, colors_sig, results_labels, results);
+            return;
+        }
+
+        // Orbit reps via WL classes
+        let (_ids, classes) = refine_color_classes(used_slots, &edges_set, colors_sig, deg);
+        let mut class_ids_sorted: Vec<usize> = classes.keys().cloned().collect();
+        class_ids_sorted.sort_unstable();
+
+        // T1: existing × existing (one representative per class pair)
+        for (i_idx, &ci) in class_ids_sorted.iter().enumerate() {
+            let Ci = classes.get(&ci).unwrap();
+            if let Some((u, v)) = pick_rep_pair(Ci, Ci, caps, &edges_set) {
+                edges.push((u, v));
+                caps[u] -= 1; caps[v] -= 1;
+                deg[u] += 1; deg[v] += 1;
+                dfs(
+                    x, max_slots, maxdeg_total, edges, colors_sig, caps, deg, used_slots, supply,
+                    edges_used + 1, results_labels, results, seen_per_level, max_future_cap, refine_color_classes, pick_rep_pair,
+                );
+                deg[u] -= 1; deg[v] -= 1;
+                caps[u] += 1; caps[v] += 1;
+                edges.pop();
+            }
+            for &cj in class_ids_sorted.iter().skip(i_idx + 1) {
+                let Cj = classes.get(&cj).unwrap();
+                if let Some((u, v)) = pick_rep_pair(Ci, Cj, caps, &edges_set) {
+                    edges.push((u, v));
+                    caps[u] -= 1; caps[v] -= 1;
+                    deg[u] += 1; deg[v] += 1;
+                    dfs(
+                        x, max_slots, maxdeg_total, edges, colors_sig, caps, deg, used_slots, supply,
+                        edges_used + 1, results_labels, results, seen_per_level, max_future_cap, refine_color_classes, pick_rep_pair,
+                    );
+                    deg[u] -= 1; deg[v] -= 1;
+                    caps[u] += 1; caps[v] += 1;
+                    edges.pop();
+                }
+            }
+        }
+
+        // T2/T3: spawn new slots if allowed
+        if used_slots < max_slots {
+            // candidate signatures (cap>0 and in stock)
+            let mut cand_sigs: Vec<u32> = supply
+                .iter()
+                .filter_map(|(&sig, &cnt)| {
+                    if cnt > 0 && (maxdeg_total - popcount_u32(sig) as i32) > 0 { Some(sig) } else { None }
+                })
+                .collect();
+            cand_sigs.sort_unstable();
+
+            // T2: existing × new (existing side uses one rep per class)
+            let mut reps_existing: Vec<usize> = Vec::new();
+            for &ci in &class_ids_sorted {
+                if let Some(list) = classes.get(&ci) {
+                    if let Some(&v) = list.iter().find(|&&v| caps[v] > 0) { reps_existing.push(v); }
+                }
+            }
+
+            for &u in &reps_existing {
+                for &sig in &cand_sigs {
+                    if supply.get(&sig).copied().unwrap_or(0) == 0 { continue; }
+                    let v = used_slots; // new index
+
+                    // activate new slot v
+                    let cap_v = max(0, maxdeg_total - popcount_u32(sig) as i32);
+                    colors_sig[v] = sig; caps[v] = cap_v; deg[v] = 0;
+                    *supply.get_mut(&sig).unwrap() -= 1;
+
+                    if caps[u] > 0 && caps[v] > 0 && !set_contains_edge(&edges_set, u, v) {
+                        edges.push((u, v));
+                        caps[u] -= 1; caps[v] -= 1; deg[u] += 1; deg[v] += 1;
+                        dfs(
+                            x, max_slots, maxdeg_total, edges, colors_sig, caps, deg, used_slots + 1, supply,
+                            edges_used + 1, results_labels, results, seen_per_level, max_future_cap, refine_color_classes, pick_rep_pair,
+                        );
+                        deg[u] -= 1; deg[v] -= 1; caps[u] += 1; caps[v] += 1; edges.pop();
+                    } else {
+                        // Even if we don't add edge u-v immediately, we don't spawn v alone here,
+                        // since the Python code tries only paired edge additions in this branch.
+                        // (Matches the intent of adding exactly one internal edge per DFS level.)
+                        dfs(
+                            x, max_slots, maxdeg_total, edges, colors_sig, caps, deg, used_slots + 1, supply,
+                            edges_used, results_labels, results, seen_per_level, max_future_cap, refine_color_classes, pick_rep_pair,
+                        );
+                    }
+
+                    // rollback v
+                    *supply.get_mut(&sig).unwrap() += 1;
+                    // No need to clear colors_sig[v], caps[v], deg[v] — they will be overwritten on next spawn
+                }
+            }
+
+            // T3: new × new (spawn two)
+            if used_slots + 2 <= max_slots {
+                for (i_idx, &sig_i) in cand_sigs.iter().enumerate() {
+                    if supply.get(&sig_i).copied().unwrap_or(0) == 0 { continue; }
+                    let u = used_slots;
+                    let cap_u = max(0, maxdeg_total - popcount_u32(sig_i) as i32);
+                    colors_sig[u] = sig_i; caps[u] = cap_u; deg[u] = 0;
+                    *supply.get_mut(&sig_i).unwrap() -= 1;
+
+                    for &sig_j in cand_sigs.iter().skip(i_idx) {
+                        if supply.get(&sig_j).copied().unwrap_or(0) == 0 { continue; }
+                        let v = used_slots + 1;
+                        let cap_v = max(0, maxdeg_total - popcount_u32(sig_j) as i32);
+                        colors_sig[v] = sig_j; caps[v] = cap_v; deg[v] = 0;
+                        *supply.get_mut(&sig_j).unwrap() -= 1;
+
+                        if caps[u] > 0 && caps[v] > 0 && !set_contains_edge(&edges_set, u, v) {
+                            edges.push((u, v));
+                            caps[u] -= 1; caps[v] -= 1; deg[u] += 1; deg[v] += 1;
+                            dfs(
+                                x, max_slots, maxdeg_total, edges, colors_sig, caps, deg, used_slots + 2, supply,
+                                edges_used + 1, results_labels, results, seen_per_level, max_future_cap, refine_color_classes, pick_rep_pair,
+                            );
+                            deg[u] -= 1; deg[v] -= 1; caps[u] += 1; caps[v] += 1; edges.pop();
+                        }
+
+                        // rollback second
+                        *supply.get_mut(&sig_j).unwrap() += 1;
+                    }
+
+                    // rollback first
+                    *supply.get_mut(&sig_i).unwrap() += 1;
+                }
+            }
+        }
     }
-  }
 
-  let pairs: Vec<(MyGraph, HashMap<usize, NodeIndex>)> = tmp_graphs_4;
+    // 7) initialize and start DFS
+    let mut colors_sig = vec![0u32; max_slots];
+    let mut caps       = vec![0i32; max_slots];
+    let mut deg        = vec![0i32; max_slots];
+    let mut edges: Vec<(usize, usize)> = Vec::new();
 
-  // 2) 次数 < 5 のものだけフィルターして、そのまま map へ
-  let result: Vec<MyGraph> = pairs
-    .into_iter()
-    .filter(|(g, _labels)| {
-      g.node_indices().all(|n| g.edges(n).count() < 5)
-    })
-    .map(|(g, _labels)| {
-      // タプルからグラフだけ取り出して渡す
-      relabel_compact_graph_preserve_first5(&g)
-    })
-    .collect();
-  
-  let deduped = deduplicate_graphs(result);
-  deduped
-}
-
-fn generate_semitight_k5_pattern_2() -> Vec<MyGraph> {
-  // 0) Prepare base graph with 22 nodes
-  let mut base_graph = Graph::<(), (), Undirected>::with_capacity(22, 0);
-  let mut base_nodes = std::collections::HashMap::new();
-  for v in 1..=22 {
-    base_nodes.insert(v, base_graph.add_node(()));
-  }
-
-  // 1) Add the fixed edges from node 1 to 6,7,8
-  base_graph.extend_with_edges(&[
-    (base_nodes[&1], base_nodes[&6]),
-    (base_nodes[&1], base_nodes[&7]),
-    (base_nodes[&1], base_nodes[&8]),
-  ]);
-
-  // 2) Pattern2: first attach one of the four base‐edge‐sets at node 2
-  let base_edge_sets = [
-    vec![(2, 9),  (2, 10), (2, 11), (2, 12)],
-    vec![(2, 6),  (2, 9),  (2, 10), (2, 11)],
-    vec![(2, 6),  (2, 7),  (2, 9),  (2, 10)],
-    vec![(2, 6),  (2, 7),  (2, 8),  (2, 9)],
-  ];
-  let mut tmp_graphs = Vec::new();
-  for edges in &base_edge_sets {
-    let mut g = base_graph.clone();
-    for &(a, b) in edges {
-      g.add_edge(base_nodes[&a], base_nodes[&b], ());
-    }
-    tmp_graphs.push(g);
-  }
-
-  // 3) K₅‐node=3 stage: choose 4 among 6..15
-  let mut tmp_graphs_2 = Vec::new();
-  for g in &tmp_graphs {
-    for comb in (6..16).combinations(4) {
-      let mut g2 = g.clone();
-      for &u in &comb {
-        g2.add_edge(base_nodes[&3], base_nodes[&u], ());
-      }
-      tmp_graphs_2.push(g2);
-    }
-  }
-  let tmp_graphs_2 = deduplicate_graphs(tmp_graphs_2);
-
-  // 4) K₅‐node=4 stage: choose 4 among 6..19
-  let mut tmp_graphs_3 = Vec::new();
-  for g in tmp_graphs_2 {
-    for comb in (6..20).combinations(4) {
-      let mut g2 = g.clone();
-      for &u in &comb {
-        g2.add_edge(base_nodes[&4], base_nodes[&u], ());
-      }
-      tmp_graphs_3.push(g2);
-    }
-  }
-  let tmp_graphs_3 = deduplicate_graphs(tmp_graphs_3);
-
-  // 5) K₅‐node=5 stage: choose 4 among 6..22, skip if deg≥4 at 6..9
-  let mut tmp_graphs_4 = Vec::new();
-  for g in tmp_graphs_3 {
-    for comb in (6..23).combinations(4) {
-      if comb.iter().any(|&u| [6, 7, 8, 9].contains(&u) &&
-          g.edges(base_nodes[&u]).count() >= 4)
-      {
-        continue;
-      }
-      let mut g2 = g.clone();
-      for &u in &comb {
-        g2.add_edge(base_nodes[&5], base_nodes[&u], ());
-      }
-      tmp_graphs_4.push(g2);
-    }
-  }
-
-  // 6) Filter out any graph with a node of degree ≥5, relabel, then dedupe
-  let result: Vec<MyGraph> = tmp_graphs_4
-    .into_iter()
-    .filter(|g| {
-      g.node_indices().all(|n| g.edges(n).count() < 5)
-    })
-    .map(|g| relabel_compact_graph_preserve_first5(&g))
-    .collect();
-
-  let deduped = deduplicate_graphs(result);
-  deduped
-}
-
-fn combinations<T: Copy>(slice: &[T], k: usize) -> Vec<Vec<T>> {
-  let mut result = vec![];
-  let mut combo = Vec::with_capacity(k);
-  combine(slice, k, 0, &mut combo, &mut result);
-  result
-}
-
-fn combine<T: Copy>(
-  slice: &[T],
-  k: usize,
-  start: usize,
-  combo: &mut Vec<T>,
-  result: &mut Vec<Vec<T>>,
-) {
-  if combo.len() == k {
-    result.push(combo.clone());
-    return;
-  }
-  for i in start..slice.len() {
-    combo.push(slice[i]);
-    combine(slice, k, i + 1, combo, result);
-    combo.pop();
-  }
-}
-
-fn graph_elimination(graphs: Vec<MyGraph>) -> Vec<MyGraph> {
-  graphs
-    .into_iter()
-    .filter(|g| g.node_indices().all(|n| g.edges(n).count() < 5))
-    .collect()
-}
-/// Deduplicate by WL-hash bucket + exact isomorphism.
-
-fn relabel_compact_graph_preserve_first5(
-  graph: &Graph<(), (), Undirected>,
-) -> Graph<(), (), Undirected> {
-  // old->new の対応表
-  let mut mapping: HashMap<NodeIndex, NodeIndex> = HashMap::new();
-  let mut new_graph = Graph::<(), (), Undirected>::with_capacity(0, 0);
-
-  // Step1: 内部インデックス 0..=4 (意味的には 外部ラベル 1..=5) を固定追加
-  for old_ix in 0..5 {
-    let old_node = NodeIndex::new(old_ix);
-    // グラフにそのノードが存在し（node_count()の範囲内）、かつ孤立でなければ
-    if old_ix < graph.node_count() && graph.edges(old_node).count() > 0 {
-      let new_node = new_graph.add_node(());
-      mapping.insert(old_node, new_node);
-    }
-  }
-
-  // Step2: 残りのノードを（内部インデックス 5 以降で）孤立でなければ追加
-  for old_node in graph.node_indices().filter(|n| n.index() >= 5) {
-    if graph.edges(old_node).count() > 0 {
-      let new_node = new_graph.add_node(());
-      mapping.insert(old_node, new_node);
-    }
-  }
-
-  // Step3: 辺を貼る
-  for edge in graph.edge_indices() {
-    let (u, v) = graph.edge_endpoints(edge).unwrap();
-    if let (Some(&u_new), Some(&v_new)) = (mapping.get(&u), mapping.get(&v)) {
-      new_graph.add_edge(u_new, v_new, ());
-    }
-  }
-
-  new_graph
-}
-
-fn deduplicate_graphs(graphs: Vec<MyGraph>) -> Vec<MyGraph> {
-  // 1) Bucket by WL‐hash
-  let mut buckets: HashMap<u64, Vec<MyGraph>> = HashMap::new();
-  let pb_hash = ProgressBar::new(graphs.len() as u64);
-  pb_hash
-    .set_style(
-      ProgressStyle::with_template("[hash ] {pos}/{len} {elapsed_precise}")
-        .unwrap()
-        .progress_chars("█▉▊▋▌▍▎▏  "),
+    dfs(
+        x, max_slots, maxdeg_total, &mut edges, &mut colors_sig, &mut caps, &mut deg,
+        0, &mut supply, 0, &mut results_labels, &mut results, &mut seen_per_level,
+        &max_future_cap, &refine_color_classes, &pick_rep_pair,
     );
 
-  for g in graphs {
-    // Clone `g` to hand it to `invariant`, then still own `g` for the bucket.
-    let h = invariant(g.clone());
-    buckets.entry(h).or_default().push(g);
-    pb_hash.inc(1);
-  }
-  pb_hash.finish_with_message("✔ Hashing complete");
-
-  // 2) Exact isomorphism filtering within each bucket
-  let total_buckets = buckets.len() as u64;
-  let pb_iso = ProgressBar::new(total_buckets);
-  pb_iso
-    .set_style(
-      ProgressStyle::with_template("[iso  ] {pos}/{len} {elapsed_precise}")
-        .unwrap()
-        .progress_chars("█▉▊▋▌▍▎▏  "),
-    );
-
-  let mut uniques = Vec::new();
-  let mut total_before = 0;
-  for (_hash, bucket) in buckets {
-    total_before += bucket.len();
-    let mut bucket_uniques = Vec::new();
-    for g in bucket {
-      if !bucket_uniques.iter().any(|h2| is_isomorphic(&g, h2)) {
-        bucket_uniques.push(g);
-      }
-    }
-    uniques.extend(bucket_uniques);
-    pb_iso.inc(1);
-  }
-  pb_iso.finish_with_message("✔ Isomorphism filtering complete");
-
-  let removed = total_before - uniques.len();
-  println!(
-    "Deduplication complete: {} → {} ({} removed)",
-    total_before,
-    uniques.len(),
-    removed
-  );
-
-  uniques
+    results
 }
 
-fn dedup_with_labels(
-  pairs: Vec<(MyGraph, HashMap<usize, NodeIndex>)>,
-) -> Vec<(MyGraph, HashMap<usize, NodeIndex>)> {
-  // 1) WL‐ハッシュでバケツ分け
-  let mut buckets: HashMap<u64, Vec<(MyGraph, HashMap<usize, NodeIndex>)>> = HashMap::new();
-  
-  let pb_hash = ProgressBar::new(pairs.len() as u64);
-  pb_hash.set_style(
-    ProgressStyle::with_template("[hash ] {pos}/{len} {elapsed_precise}")
-      .unwrap()
-      .progress_chars("█▉▊▋▌▍▎▏  "),
-  );
-  
-  for (g, labels) in pairs {
-    let h = invariant(g.clone());
-    buckets.entry(h).or_default().push((g, labels));
-    pb_hash.inc(1);
-  }
-  pb_hash.finish_with_message("✔ Hashing complete");
-  
-  // 2) Exact isomorphism filtering within each bucket
-  let total_buckets = buckets.len() as u64;
-  let pb_iso = ProgressBar::new(total_buckets);
-  pb_iso.set_style(
-    ProgressStyle::with_template("[iso  ] {pos}/{len} {elapsed_precise}")
-      .unwrap()
-      .progress_chars("█▉▊▋▌▍▎▏  "),
-  );
-  
-  let mut uniques = Vec::new();
-  let mut total_before = 0;
-  for (_h, bucket) in buckets {
-    total_before += bucket.len();
-    let mut bucket_uniques = Vec::new();
-    for (g, labels) in bucket {
-      if !bucket_uniques.iter().any(|(g2, _)| is_isomorphic(&g, g2)) {
-        bucket_uniques.push((g, labels));
-      }
+// ---- Assemble full graph in original labels -----------------------------------
+
+fn assemble_full_graph_complete(
+    a_labels: &[i64],                 // e.g., [1,2,3,4]
+    canon_edges_bb: &[(usize, usize)],
+    canon_colors_b: &[u32],
+    total_sig_pool: &HashMap<u32, usize>,
+    b_ids_sorted: &[i64],
+) -> (Vec<(i64, i64)>, Vec<i64>) {
+    let m_active = canon_colors_b.len();
+    let mut used: HashMap<u32, usize> = HashMap::new();
+    for &sig in canon_colors_b { *used.entry(sig).or_insert(0) += 1; }
+
+    let mut all_sigs: BTreeSet<u32> = BTreeSet::new();
+    for &s in total_sig_pool.keys() { all_sigs.insert(s); }
+    for &s in used.keys() { all_sigs.insert(s); }
+
+    // remain[sig] = max(0, total - used)
+    // BTreeMap を使っているので順番通りにイテレートできる
+    let mut remain: BTreeMap<u32, usize> = BTreeMap::new();
+    for &s in all_sigs.iter() {
+        let total = *total_sig_pool.get(&s).unwrap_or(&0);
+        let u = *used.get(&s).unwrap_or(&0);
+        remain.insert(s, total.saturating_sub(u));
     }
-    uniques.extend(bucket_uniques);
-    pb_iso.inc(1);
-  }
-  pb_iso.finish_with_message("✔ Isomorphism filtering complete");
-  
-  let removed = total_before - uniques.len();
-  println!(
-    "Deduplication complete: {} → {} ({} removed)",
-    total_before,
-    uniques.len(),
-    removed
-  );
-  
-  uniques
-}
 
-fn relabel_compact_graph(graph: &Graph<(), (), Undirected>) -> Graph<(), (), Undirected> {
-  let mut mapping = HashMap::new();
-  let mut new_graph = Graph::new_undirected();
+    let m_remain: usize = remain.values().copied().sum();
+    let m_total = m_active + m_remain;
 
-  // Step 1: Add non-isolated nodes with new indices
-  for node in graph.node_indices() {
-    if graph.edges(node).count() > 0 {
-      let new_node = new_graph.add_node(());
-      mapping.insert(node, new_node);
+    // Extend B label list if needed
+    let mut b_ids_extended: Vec<i64> = b_ids_sorted.to_vec();
+    if m_total > b_ids_extended.len() {
+        let start = if b_ids_extended.is_empty() { 1 } else { b_ids_extended.iter().copied().max().unwrap() + 1 };
+        let need = (m_total - b_ids_extended.len()) as i64;
+        for i in 0..need { b_ids_extended.push(start + i); }
     }
-  }
 
-  // Step 2: Add edges using new node indices
-  for edge in graph.edge_indices() {
-    let (u, v) = graph.edge_endpoints(edge).unwrap();
-    if let (Some(&u_new), Some(&v_new)) = (mapping.get(&u), mapping.get(&v)) {
-      new_graph.add_edge(u_new, v_new, ());
-    }
-  }
-  new_graph
-}
+    // Map temporary indices 0..m_total-1 to real labels
+    let mut b_map: HashMap<usize, i64> = HashMap::new();
+    for i in 0..m_total { b_map.insert(i, b_ids_extended[i]); }
 
-fn save_split_graphs(path_prefix: &str, graphs: &[MyGraph], num_parts: usize) {
-  use indicatif::{ProgressBar, ProgressStyle};
+    let mut edges_full: Vec<(i64, i64)> = Vec::new();
 
-  let total = graphs.len();
-  let chunk_size = (total + num_parts - 1) / num_parts; // ceiling division
-
-  let pb = ProgressBar::new(num_parts as u64);
-  pb.set_style(
-    ProgressStyle::with_template("[split] {pos}/{len} {elapsed_precise}")
-      .unwrap()
-      .progress_chars("█▉▊▋▌▍▎▏  "),
-  );
-
-  for i in 0..num_parts {
-    let start = i * chunk_size;
-    let end = usize::min(start + chunk_size, total);
-    let chunk = &graphs[start..end];
-    let filename = format!("{}part_{}.json", path_prefix, i + 1);
-    save_graphs(&filename, chunk);
-    pb.inc(1);
-  }
-
-  pb.finish_with_message("✔ Split saving complete");
-}
-
-// Pattern 1:
-fn generate_plus_1_node_or_edge_graphs_pattern_1(input_path: &str, output_path: &str) {
-  let pattern_graphs = load_graphs(input_path);
-  let mut result = Vec::new();
-
-  // 🟦 Combined Progress Bar: +1 node + +1 edge
-  let pb = ProgressBar::new((2 * pattern_graphs.len()) as u64);
-  pb.set_style(
-    ProgressStyle::with_template("[+1 step] [{elapsed_precise}] {wide_bar:.cyan/blue} {pos}/{len}")
-      .unwrap()
-  );
-
-  // ➕ +1 node case
-  for graph in &pattern_graphs {
-    pb.inc(1);
-    for v in 5..graph.node_count() {
-      if graph.edges(NodeIndex::new(v)).count() == 4 {
-        continue;
-      }
-      let mut g = graph.clone();
-      let new_node = g.add_node(());
-      g.add_edge(NodeIndex::new(v), new_node, ());
-      let g_clean = relabel_compact_graph(&g);
-      result.push(g_clean);
-    }
-  }
-
-  // ➕ +1 edge case
-  for graph in &pattern_graphs {
-    pb.inc(1);
-    for v in 5..graph.node_count() {
-      if graph.edges(NodeIndex::new(v)).count() == 4 {
-        continue;
-      }
-      for w in (v+1)..graph.node_count() {
-        if graph.edges(NodeIndex::new(w)).count() == 4 {
-          continue;
+    // A–B for active B
+    for (b_idx, &sig) in canon_colors_b.iter().enumerate() {
+        let b_real = b_map[&b_idx];
+        for (bit, &a_lab) in a_labels.iter().enumerate() {
+            if ((sig >> bit) & 1) == 1 {
+                let u = a_lab; let v = b_real;
+                edges_full.push(if u < v { (u, v) } else { (v, u) });
+            }
         }
-        let mut g = graph.clone();
-        g.add_edge(NodeIndex::new(v), NodeIndex::new(w), ());
-        let g_clean = relabel_compact_graph(&g);
-        result.push(g_clean);
-      }
     }
-  }
 
-  pb.finish_with_message("Finished +1 node/edge");
+    // B–B for active B
+    for &(u_idx, v_idx) in canon_edges_bb {
+        let u_real = b_map[&u_idx];
+        let v_real = b_map[&v_idx];
+        let (u, v) = if u_real < v_real { (u_real, v_real) } else { (v_real, u_real) };
+        edges_full.push((u, v));
+    }
 
-  let plus_1_edge_graphs = deduplicate_graphs(result);
-  save_graphs(output_path, &plus_1_edge_graphs);
+    // Remaining (inactive) B: add only A–B edges
+    let mut cur = m_active;
+    for (&sig, &cnt) in remain.iter() {
+        for _ in 0..cnt {
+            let b_real = b_map[&cur];
+            for (bit, &a_lab) in a_labels.iter().enumerate() {
+                if ((sig >> bit) & 1) == 1 {
+                    let u = a_lab; let v = b_real;
+                    edges_full.push(if u < v { (u, v) } else { (v, u) });
+                }
+            }
+            cur += 1;
+        }
+    }
+
+    edges_full.sort_unstable();
+    edges_full.dedup();
+
+    (edges_full, b_ids_extended)
 }
 
-use indicatif::{ProgressBar, ProgressStyle};
+// ---- Global canonicalization (marker gadgets; A by degree class; B mono) ----
+fn canon_label_whole_with_markers(
+    a_labels: &[i64],
+    b_ids_extended: &[i64],
+    edges_full_int: &[(i64, i64)],
+) -> CanonLabeling {
+    // 収録ノードを列挙
+    let mut nodes_set: BTreeSet<i64> = BTreeSet::new();
+    for &(u, v) in edges_full_int { nodes_set.insert(u); nodes_set.insert(v); }
+    let nodes: Vec<i64> = nodes_set.into_iter().collect();
+    let n = nodes.len();
 
-fn generate_plus_2_node_or_edge_graphs_pattern_1(input_path: &str, output_path: &str) {
-  let plus_1_edge_graphs = load_graphs(input_path);
-  let mut result = Vec::new();
-
-  // ✅ Unified progress bar for +2 node and +2 edge
-  let total = 2 * plus_1_edge_graphs.len() as u64;
-  let pb = ProgressBar::new(total);
-  pb.set_style(ProgressStyle::with_template(
-    "[+2 step] [{elapsed_precise}] {wide_bar:.yellow/black} {pos}/{len}"
-  ).unwrap());
-
-  // ➕ +2 node case
-  for graph in &plus_1_edge_graphs {
-    pb.inc(1);
-    for v in 5..graph.node_count() {
-      if graph.edges(NodeIndex::new(v)).count() == 4 {
-        continue;
-      }
-      let mut g = graph.clone();
-      let new_node = g.add_node(());
-      g.add_edge(NodeIndex::new(v), new_node, ());
-      result.push(g);
+    // 実ラベル -> petgraph ノード index
+    let mut g: Graph<(), (), Undirected> = Graph::with_capacity(n + 4, edges_full_int.len() + n);
+    let mut idx: HashMap<i64, _> = HashMap::new();
+    for &v in &nodes {
+        let nd = g.add_node(());
+        idx.insert(v, nd);
     }
-  }
-
-  // ➕ +2 edge case
-  for graph in &plus_1_edge_graphs {
-    pb.inc(1);
-    for v in 5..graph.node_count() {
-      if graph.edges(NodeIndex::new(v)).count() == 4 {
-        continue;
-      }
-      for w in (v+1)..graph.node_count() {
-        if graph.edges(NodeIndex::new(w)).count() == 4 {
-          continue;
-        }
-        if graph.find_edge(NodeIndex::new(v), NodeIndex::new(w)).is_some() {
-          continue;
-        }
-        let mut g = graph.clone();
-        g.add_edge(NodeIndex::new(v), NodeIndex::new(w), ());
-        result.push(g);
-      }
+    // エッジを追加
+    for &(u, v) in edges_full_int {
+        g.add_edge(idx[&u], idx[&v], ());
     }
-  }
+    // マーカー頂点：A(4), A(3), B 共通
+    let a4_marker = g.add_node(());
+    let a3_marker = g.add_node(());
+    let b_marker  = g.add_node(());
 
-  pb.finish_with_message("Finished +2 node/edge steps");
-
-  let plus_2_edge_graphs = deduplicate_graphs(result);
-  save_graphs(output_path, &plus_2_edge_graphs);
+    let b_set: HashSet<i64> = b_ids_extended.iter().copied().collect();
+    // A 側：度クラスごとにマーカーへ
+    for &a in a_labels {
+        if b_set.contains(&a) { continue; }
+        let a_idx = (a - 1) as usize;
+        let degv = if a_idx < A_DEGS.len() { A_DEGS[a_idx] } else { 0 };
+        if let Some(&a_nd) = idx.get(&a) {
+            match degv {
+                4 => { let _ = g.add_edge(a_nd, a4_marker, ()); }
+                3 => { let _ = g.add_edge(a_nd, a3_marker, ()); }
+                _ => {}
+            }
+        } else {
+            // ここで状況を出す
+            eprintln!("[DEBUG] A vertex {a} not present in edges_full_int. \
+                    nodes={:?}, b_set={:?}", nodes, b_set);
+            // 必要なら「無ければ追加」も可能：
+            // let a_nd = g.add_node(());
+            // idx.insert(a, a_nd);
+        }
+    }
+    // B 側
+    for &b in b_ids_extended {
+        let b_node = if let Some(&nd) = idx.get(&b) {
+            nd
+        } else {
+            // eprintln!("[WARN] B node {b} missing in idx; adding as isolated.");
+            let nd = g.add_node(());
+            idx.insert(b, nd);
+            nd
+        };
+        let _ = g.add_edge(b_node, b_marker, ());
+    }
+    CanonLabeling::new(&g)
 }
 
-fn generate_plus_1_node_or_edge_graphs_pattern_2(input_path: &str, output_path: &str) {
-  let pattern_graphs = load_graphs(input_path);
-  let mut result: Vec<MyGraph> = Vec::new();
+// ---- Pipeline driver -----------------------------------------------------------
 
-  // 🟦 Combined Progress Bar: +1 node + +1 edge
-  let pb = ProgressBar::new((2 * pattern_graphs.len()) as u64);
-  pb.set_style(
-    ProgressStyle::with_template("[+1 step] [{elapsed_precise}] {wide_bar:.cyan/blue} {pos}/{len}")
-      .unwrap()
-  );
-
-  // ➕ +1 node case
-  for graph in &pattern_graphs {
-    pb.inc(1);
-    for v in 5..graph.node_count() {
-      if graph.edges(NodeIndex::new(v)).count() == 4 {
-        continue;
-      }
-      let mut g = graph.clone();
-      let new_node = g.add_node(());
-      g.add_edge(NodeIndex::new(v), new_node, ());
-      let g_clean = relabel_compact_graph(&g);
-      result.push(g_clean);
-    }
-  }
-
-  // ➕ +1 edge case
-  for graph in &pattern_graphs {
-    pb.inc(1);
-    for v in 5..graph.node_count() {
-      if graph.edges(NodeIndex::new(v)).count() == 4 {
-        continue;
-      }
-      for w in (v+1)..graph.node_count() {
-        if w == v || graph.edges(NodeIndex::new(w)).count() == 4 {
-          continue;
-        }
-        let mut g = graph.clone();
-        g.add_edge(NodeIndex::new(v), NodeIndex::new(w), ());
-        let g_clean = relabel_compact_graph(&g);
-        result.push(g_clean);
-      }
-    }
-  }
-
-  pb.finish_with_message("✔ Finished +1 node/edge");
-
-  let plus_1_edge_graphs = deduplicate_graphs(result);
-  save_graphs(output_path, &plus_1_edge_graphs);
+#[derive(Debug)]
+struct Config {
+    in_json_path: PathBuf,
+    out_json_path: PathBuf,
+    a_labels: Vec<i64>,
+    x_internal_edges: usize,
+    maxdeg_total: i32,
 }
 
-// +2 node or edge
-fn generate_plus_2_node_or_edge_graphs_pattern_2(input_path: &str, output_path: &str) {
-  let plus_1_edge_graphs = load_graphs(input_path);
-  let mut result: Vec<MyGraph> = Vec::new();
+fn run_pipeline(cfg: &Config) -> Result<()> {
+    // Read input JSON: Vec<Vec<[u,v]>>
+    let mut f = File::open(&cfg.in_json_path)
+        .with_context(|| format!("Failed to open input: {:?}", cfg.in_json_path))?;
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    // JSON の デシリアライズ
+    let graphs_in: Vec<Vec<[i64; 2]>> = serde_json::from_str(&s)
+        .with_context(|| "Failed to parse input JSON as Vec<Vec<[i64;2]>>")?;
+    // 結果用の Vector
+    let mut all_out_graphs: Vec<Vec<[i64; 2]>> = Vec::new();
+    // 全体同型の去重複は CanonLabeling をキーに
+    // TODO: CanonLabeling を使うので OK なのか？？
+    let mut seen_global: HashSet<CanonLabeling> = HashSet::new();
 
-  // ✅ Unified progress bar for +2 node and +2 edge
-  let total = 2 * plus_1_edge_graphs.len() as u64;
-  let pb = ProgressBar::new(total);
-  pb.set_style(
-    ProgressStyle::with_template("[+2 step] [{elapsed_precise}] {wide_bar:.yellow/black} {pos}/{len}")
-      .unwrap()
-  );
+    let k_left = cfg.a_labels.len();
+    let amax = *cfg.a_labels.iter().max().unwrap_or(&0);
 
-  // ➕ +2 node case
-  for graph in &plus_1_edge_graphs {
-    pb.inc(1);
-    for v in 5..graph.node_count() {
-      if graph.edges(NodeIndex::new(v)).count() == 4 {
-        continue;
-      }
-      let mut g = graph.clone();
-      let new_node = g.add_node(());
-      g.add_edge(NodeIndex::new(v), new_node, ());
-      result.push(g);
-    }
-  }
-
-  // ➕ +2 edge case
-  for graph in &plus_1_edge_graphs {
-    pb.inc(1);
-    for v in 5..graph.node_count() {
-      if graph.edges(NodeIndex::new(v)).count() == 4 {
-        continue;
-      }
-      for w in (v+1)..graph.node_count() {
-        if v == w || graph.edges(NodeIndex::new(w)).count() == 4 {
-          continue;
+    for edge_list in graphs_in {
+        // 1) split A/B
+        let mut edges_ab: Vec<(usize, i64)> = Vec::new();
+        let mut b_ids: BTreeSet<i64> = BTreeSet::new();
+        for e in edge_list {
+            let (u, v) = (e[0], e[1]);
+            let (a, b) = if u <= amax { (u, v) } else { (v, u) };
+            edges_ab.push(((a - 1) as usize, b));
+            b_ids.insert(b);
         }
-        // skip existing edge
-        if graph.find_edge(NodeIndex::new(v), NodeIndex::new(w)).is_some() {
-          continue;
+        let b_ids_sorted: Vec<i64> = b_ids.into_iter().collect();
+
+        // 2) signature pool from bipartite
+        let sig_pool = build_sig_pool_from_bipartite(k_left, &edges_ab);
+
+        // 3) enumerate B–B structures
+        let sols: Vec<CanonPair> = enumerate_union_internal_graphs_orbits_unified(
+            cfg.x_internal_edges, &sig_pool, None, cfg.maxdeg_total,
+        );
+
+        // 4) assemble, canonicalize whole graph, dedup
+        for CanonPair { edges: canon_edges_bb, colors: canon_colors_b } in sols {
+            let (edges_full, b_ids_extended) = assemble_full_graph_complete(
+                &cfg.a_labels, &canon_edges_bb, &canon_colors_b, &sig_pool, &b_ids_sorted,
+            );
+            // TODO: 恐らく問題ないが、CanonLabeling をキーにして良いのか？
+            let label = canon_label_whole_with_markers(&cfg.a_labels, &b_ids_extended, &edges_full);
+            if !seen_global.insert(label) { continue; } // already seen
+
+            // push in original JSON shape
+            let mut one_graph: Vec<[i64; 2]> = Vec::with_capacity(edges_full.len());
+            for (u, v) in edges_full { one_graph.push([u, v]); }
+            all_out_graphs.push(one_graph);
         }
-        let mut g = graph.clone();
-        g.add_edge(NodeIndex::new(v), NodeIndex::new(w), ());
-        result.push(g);
-      }
     }
-  }
 
-  pb.finish_with_message("✔ Finished +2 node/edge steps");
+    // write output JSON
+    let f = File::create(&cfg.out_json_path)
+        .with_context(|| format!("Failed to create output: {:?}", cfg.out_json_path))?;
+    serde_json::to_writer_pretty(f, &all_out_graphs).with_context(|| "Failed to write output JSON")?;
 
-  let plus_2_edge_graphs = deduplicate_graphs(result);
-  save_graphs(output_path, &plus_2_edge_graphs);
+    println!("number of output graphs: {}", all_out_graphs.len());
+    Ok(())
 }
 
-fn main() {
-  for part in 1..=20 {
-    let inputs = [
-      format!("graphs/semitight_K_5_pattern_1/part_{}.json", part),
-      format!("graphs/semitight_K_5_pattern_1_plus_1/part_{}.json", part),
-      format!("graphs/semitight_K_5_pattern_1_plus_2/part_{}.json", part),
-      format!("graphs/semitight_K_5_pattern_2/part_{}.json", part),
-      format!("graphs/semitight_K_5_pattern_2_plus_1/part_{}.json", part),
-      format!("graphs/semitight_K_5_pattern_2_plus_2/part_{}.json", part),
-    ];
+// ---- CLI ----------------------------------------------------------------------
 
-    for path in &inputs {
-      // If load_graphs takes &str: use path.as_str()
-      // If it’s AsRef<Path>, you can pass path directly
-      let graphs = load_graphs(path);
-      check_statement::check_statement_t_6(&graphs, 6);
-      println!("Checked statement for {}", path);
+fn parse_args() -> Result<Config> {
+    // Minimal ad-hoc parser to avoid extra deps
+    let mut in_json_path = None;
+    let mut out_json_path = None;
+    let mut a_labels: Vec<i64> = vec![1, 2, 3, 4];
+    let mut x_internal_edges: usize = INTERNAL_EDGES;
+    let mut maxdeg_total: i32 = 4;
+
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--in" => { in_json_path = Some(PathBuf::from(args[i + 1].clone())); i += 2; }
+            "--out" => { out_json_path = Some(PathBuf::from(args[i + 1].clone())); i += 2; }
+            "--a-labels" => {
+                // comma-separated e.g. 1,2,3,4
+                let vals = args[i + 1].split(',').filter(|s| !s.is_empty()).map(|s| s.parse::<i64>().unwrap());
+                a_labels = vals.collect();
+                i += 2;
+            }
+            "--x" => { x_internal_edges = args[i + 1].parse::<usize>().unwrap(); i += 2; }
+            "--maxdeg" => { maxdeg_total = args[i + 1].parse::<i32>().unwrap(); i += 2; }
+            _ => { i += 1; }
+        }
     }
-  }
+
+    let in_json_path = in_json_path.context("--in <path> is required")?;
+    let out_json_path = out_json_path.context("--out <path> is required")?;
+
+    Ok(Config { in_json_path, out_json_path, a_labels, x_internal_edges, maxdeg_total })
 }
 
+fn main() -> Result<()> {
+    let start = Instant::now();
 
+    // バッチ設定
+    const PART_START: usize = 1;
+    const PART_END: usize = 151;
+    const INTERNAL_EDGES_SET: [usize; 3] = [4, 5, 6];
+
+    // ベースパス（4_4_4_3_0 固定）
+    let in_base = Path::new("graphs/json/new_class/foundation/4_4_4_3_0");
+    let out_base = Path::new("graphs/json/new_class/complete/4_4_4_3_0");
+
+    // 出力ディレクトリを念のため作成
+    fs::create_dir_all(out_base)?;
+
+    // 全タスクをベクタに展開
+    let tasks: Vec<(usize, usize)> = (PART_START..=PART_END)
+        .flat_map(|part| INTERNAL_EDGES_SET.iter().map(move |&x| (part, x)))
+        .collect();
+
+    let total = tasks.len();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    tasks.par_iter().for_each(|(part, x_internal_edges)| {
+        let in_path = in_base.join(format!("part_{part}.json"));
+        let out_path = out_base.join(format!("part_{part}_{x_internal_edges}.json"));
+
+        if !in_path.exists() {
+            eprintln!("[skip] part {part} not found");
+        } else {
+            let cfg = Config {
+                in_json_path: in_path,
+                out_json_path: out_path,
+                a_labels: vec![1, 2, 3, 4],
+                x_internal_edges: *x_internal_edges,
+                maxdeg_total: 4,
+            };
+
+            if let Err(e) = run_pipeline(&cfg) {
+                eprintln!("[err] part {part}, INTERNAL_EDGES={x_internal_edges}: {e}");
+            }
+        }
+
+        let done = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let progress = (done as f64 / total as f64) * 100.0;
+        println!("[{done}/{total} | {progress:5.1}%] finished part {part}, edges={x_internal_edges}");
+    });
+
+    println!("all done in {:.3} 秒", start.elapsed().as_secs_f64());
+    Ok(())
+}
