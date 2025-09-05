@@ -1,20 +1,20 @@
 use std::cmp::max;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::File;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 // Added for canonical labeling with colors (nauty via graph-canon)
 use petgraph::{Graph, Undirected};
+use petgraph::graphmap::UnGraphMap;
 use graph_canon::canon::CanonLabeling;
+use graph_enumeration::check_statement_t_6;
 
 
 // ---- Parameters (equivalent to Python globals) ---------------------------------
@@ -714,53 +714,146 @@ fn parse_args() -> Result<Config> {
     Ok(Config { in_json_path, out_json_path, a_labels, x_internal_edges, maxdeg_total })
 }
 
+/// =============== ログ ===============
+
+fn append_logs(log_path: &Path, header: &str, lines: &[String]) -> Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("failed to open log {}", log_path.display()))?;
+    // 見出し（ファイルを跨いで追記されても識別しやすく）
+    writeln!(f, "===== {} =====", header)?;
+    for line in lines {
+        // lines 自体に改行が含まれている想定なので、そのまま書き出し
+        f.write_all(line.as_bytes())?;
+        if !line.ends_with('\n') {
+            writeln!(f)?;
+        }
+    }
+    Ok(())
+}
+
+// ===== JSON 形式（「二重リスト：各グラフ = [ [u,v], ... ]」） =====
+#[derive(Deserialize)]
+struct AllGraphs(Vec<Vec<[usize; 2]>>);
+
+fn load_graphs_from_json(path: &Path) -> Result<Vec<UnGraphMap<usize, ()>>> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let AllGraphs(raw_graphs): AllGraphs =
+        serde_json::from_reader(reader)
+            .with_context(|| format!("failed to parse JSON {}", path.display()))?;
+    let mut graphs: Vec<UnGraphMap<usize, ()>> = Vec::with_capacity(raw_graphs.len());
+    for edges in raw_graphs {
+        let mut g = UnGraphMap::<usize, ()>::new();
+        for [mut u, mut v] in edges {
+            if u == v {
+                continue; // 自己ループは除外（必要なら保持に変更）
+            }
+            if v < u {
+                std::mem::swap(&mut u, &mut v);
+            }
+            g.add_edge(u, v, ());
+        }
+        graphs.push(g);
+    }
+    Ok(graphs)
+}
+
+
 fn main() -> Result<()> {
     let start = Instant::now();
 
-    // バッチ設定
-    const PART_START: usize = 1;
-    const PART_END: usize = 151;
-    const INTERNAL_EDGES_SET: [usize; 3] = [4, 5, 6];
+    const PART_START: usize = 9;
+    const PART_END: usize = 71;
+    const INTERNAL_EDGES_SET: [usize;1] = [6];
+    // const SKIP_PARTS: &[usize] = &[1,2,3,4,5,6,13,15,18,19,22,29,32,33];
+    const SKIP_PARTS: &[usize] = &[];
+    const WINDOW: usize = 10; // 調整ポイント：並列度×4 の上限になる
 
-    // ベースパス（4_4_4_3_0 固定）
-    let in_base = Path::new("graphs/json/new_class/foundation/4_4_4_3_0");
-    let out_base = Path::new("graphs/json/new_class/complete/4_4_4_3_0");
-
-    // 出力ディレクトリを念のため作成
+    let in_base = Path::new("graphs/json/new_class/foundation/4_4_3_3_0");
+    let out_base = Path::new("graphs/json/new_class/complete/4_4_3_3_0");
+    let test_base = Path::new("graphs/json/new_class/complete");
     fs::create_dir_all(out_base)?;
 
-    // 全タスクをベクタに展開
-    let tasks: Vec<(usize, usize)> = (PART_START..=PART_END)
-        .flat_map(|part| INTERNAL_EDGES_SET.iter().map(move |&x| (part, x)))
-        .collect();
-
-    let total = tasks.len();
+    let skip: HashSet<usize> = SKIP_PARTS.iter().copied().collect();
+    let parts: Vec<_> = (PART_START..=PART_END).filter(|p| !skip.contains(p)).collect();
+    let total = parts.len() * INTERNAL_EDGES_SET.len();
     let counter = Arc::new(AtomicUsize::new(0));
 
-    tasks.par_iter().for_each(|(part, x_internal_edges)| {
-        let in_path = in_base.join(format!("part_{part}.json"));
-        let out_path = out_base.join(format!("part_{part}_{x_internal_edges}.json"));
-
-        if !in_path.exists() {
-            eprintln!("[skip] part {part} not found");
-        } else {
-            let cfg = Config {
-                in_json_path: in_path,
-                out_json_path: out_path,
-                a_labels: vec![1, 2, 3, 4],
-                x_internal_edges: *x_internal_edges,
-                maxdeg_total: 4,
-            };
-
-            if let Err(e) = run_pipeline(&cfg) {
-                eprintln!("[err] part {part}, INTERNAL_EDGES={x_internal_edges}: {e}");
+    for window in parts.chunks(WINDOW) {
+        // 窓ごとは順に進む
+        window.par_iter().for_each(|&part| {
+            let in_path = in_base.join(format!("part_{part}.json"));
+            if !in_path.exists() {
+                eprintln!("[skip] part {part} not found");
+                return;
             }
-        }
 
-        let done = counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let progress = (done as f64 / total as f64) * 100.0;
-        println!("[{done}/{total} | {progress:5.1}%] finished part {part}, edges={x_internal_edges}");
-    });
+            // 窓内の各 part では x=3,4,5 を並列
+            INTERNAL_EDGES_SET.par_iter().for_each(|&x_internal_edges| {
+                let in_path = in_base.join(format!("part_{part}.json"));
+                let out_path = out_base.join(format!("part_{part}_{x_internal_edges}.json"));
+                let log_path = out_base.join(format!("part_{part}_counter_example.log"));
+                let test_out_path = test_base.join(format!("4_4_3_3_0_7_test_rs.json"));
+                let test_log_path = test_base.join(format!("4_4_3_3_0_7_test_counter_examples.log"));
+
+                // let cfg = Config {
+                //     in_json_path: in_path,
+                //     out_json_path: out_path,
+                //     a_labels: vec![1, 2, 3, 4],
+                //     x_internal_edges,
+                //     maxdeg_total: 4,
+                // };
+
+                // if let Err(e) = run_pipeline(&cfg) {
+                //     eprintln!("[err] part {part}, INTERNAL_EDGES={x_internal_edges}: {e}");
+                // }
+
+                // 生成した out_path を読み込み、t=6 でチェック
+                let mut any_error = false;
+                match load_graphs_from_json(&test_out_path) {
+                    Ok(graphs) => {
+                        let comment = format!("part_{part}_{x_internal_edges}.json");
+                        let logs = check_statement_t_6(&graphs, &comment);
+                        if !logs.is_empty() {
+                            // 3) 例外ログがあればファイルに追記
+                            if let Err(e) = append_logs(&test_log_path, &comment, &logs) {
+                                eprintln!("!! failed to write log {}: {:#}", test_log_path.display(), e);
+                            }
+                            any_error = true;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "!! failed to load generated JSON {}: {:#}",
+                            out_path.display(),
+                            e
+                        );
+                        any_error = true;
+                    }
+                }
+
+                let done = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let progress = (done as f64 / total as f64) * 100.0;
+                if any_error {
+                    println!(
+                        "[{done}/{total} | {progress:5.1}%] finished part {part}, edges={x_internal_edges} (with findings)"
+                    );
+                } else {
+                    println!(
+                        "[{done}/{total} | {progress:5.1}%] finished part {part}, edges={x_internal_edges}"
+                    );
+                }
+            });
+        });
+        // ← この for で“次の窓”に進むので、大崩れしない進行順序と高い並列度を両立
+    }
 
     println!("all done in {:.3} 秒", start.elapsed().as_secs_f64());
     Ok(())
