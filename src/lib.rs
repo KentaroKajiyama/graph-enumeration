@@ -4,9 +4,12 @@ use petgraph::graphmap::UnGraphMap;
 use rand::prelude::*;
 use rand_distr::{Distribution, StandardNormal};
 use std::collections::{HashMap, HashSet};
-
-
-
+use anyhow::{bail, Context, Result};
+use std::io::{BufWriter, Write};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use serde::{Deserialize, self};
+use std::path::Path;
 /// =============== 乱数ベクトル生成 ===============
 
 fn random_normal_matrix(n: usize, t: usize, seed: Option<u64>) -> Vec<Vec<f64>> {
@@ -569,4 +572,124 @@ pub fn check_statement_t_6(graphs: &[UnGraphMap<usize, ()>], comment: &str) -> V
     pb.finish();
 
     logs
+}
+
+
+/// =============== JSON <=> Graph6 変換 ===============
+
+// 入力 JSON をゆるく受けるための型
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InputJson {
+    // [[[u,v],...], ...]
+    ManyVec(Vec<Vec<[usize; 2]>>),
+    // {"graphs":[[[u,v],...], ...]}
+    WithKey { graphs: Vec<Vec<[usize; 2]>> },
+    // {"n":N,"edges":[[u,v],...]}（単一グラフ）
+    Single { n: Option<usize>, edges: Vec<[usize; 2]> },
+}
+
+pub fn process_one(in_base: &Path, out_base: &Path, in_path: &Path) -> Result<()> {
+    // 出力先パスを決める（in_base からの相対パスを out_base 配下に）
+    let rel = in_path
+        .strip_prefix(in_base)
+        .with_context(|| format!("strip_prefix {} from {}", in_base.display(), in_path.display()))?;
+    let mut out_path = out_base.join(rel);
+    // 拡張子 .json → .g6
+    out_path.set_extension("g6");
+
+    // 親ディレクトリを作成
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create dir {}", parent.display()))?;
+    }
+
+    // JSON を読む
+    let bytes = fs::read(in_path).with_context(|| format!("read {}", in_path.display()))?;
+    let parsed: InputJson = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse JSON {}", in_path.display()))?;
+
+    // 取り出し方を統一
+    let graphs: Vec<Vec<[usize; 2]>> = match parsed {
+        InputJson::ManyVec(v) => v,
+        InputJson::WithKey { graphs } => graphs,
+        InputJson::Single { n: _maybe_n, edges } => vec![edges],
+    };
+
+    // 書き込み（1行1グラフ）
+    let file = fs::File::create(&out_path).with_context(|| format!("create {}", out_path.display()))?;
+    let mut w = BufWriter::new(file);
+
+    for edges in graphs {
+        let g6 = edges_to_graph6(&edges)?;
+        writeln!(w, "{g6}")?;
+    }
+    w.flush()?;
+
+    Ok(())
+}
+
+/// 辺集合 -> graph6（n<=62 の簡易実装）
+pub fn edges_to_graph6(edges: &[[usize; 2]]) -> Result<String> {
+    // ラベル集合を 0..n-1 へ再ラベル
+    let mut labels: BTreeSet<usize> = BTreeSet::new();
+    for &e in edges {
+        if e[0] != e[1] {
+            labels.insert(e[0]);
+            labels.insert(e[1]);
+        }
+    }
+    let n = labels.len();
+    if n == 0 {
+        return Ok("@".to_string()); // 空グラフ（n=0）
+    }
+    if n > 62 {
+        bail!("n={} > 62 is not supported", n);
+    }
+    let map: BTreeMap<usize, usize> = labels.iter().enumerate().map(|(i, &lab)| (lab, i)).collect();
+
+    // 上三角のビット列（i<j）
+    let mut adj = vec![vec![false; n]; n];
+    for &e in edges {
+        if e[0] == e[1] {
+            continue; // 自己ループは無視（graph6 は単純無向）
+        }
+        let u = map[&e[0]];
+        let v = map[&e[1]];
+        let (i, j) = if u < v { (u, v) } else { (v, u) };
+        adj[i][j] = true;
+    }
+    let mut bits = Vec::<bool>::with_capacity(n * (n - 1) / 2);
+    for i in 0..n {
+        for j in (i + 1)..n {
+            bits.push(adj[i][j]);
+        }
+    }
+
+    // graph6（小サイズ：n を 1 文字、辺ビットを 6bit 塊で +63 して文字化）
+    let mut out = String::new();
+    out.push(((n as u8) + 63) as char);
+    if bits.is_empty() {
+        return Ok(out);
+    }
+
+    let mut acc: u8 = 0;
+    let mut k = 0;
+    for (idx, &b) in bits.iter().enumerate() {
+        acc <<= 1;
+        if b {
+            acc |= 1;
+        }
+        k += 1;
+        if k == 6 {
+            out.push((acc + 63) as char);
+            acc = 0;
+            k = 0;
+        }
+        if idx == bits.len() - 1 && k != 0 {
+            acc <<= 6 - k; // 0 詰め
+            out.push((acc + 63) as char);
+        }
+    }
+    Ok(out)
 }

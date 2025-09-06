@@ -305,6 +305,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "graph-canon",
+ "graph6",
  "indicatif",
  "itertools",
  "nalgebra",
@@ -314,8 +315,15 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "walkdir",
  "wl_isomorphism",
 ]
+
+[[package]]
+name = "graph6"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19f7787a5d56ae68c11b444958a98a4a3619fb77e646d4eb6a022d2b9b89616f"
 
 [[package]]
 name = "hashbrown"
@@ -852,6 +860,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "same-file"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
+dependencies = [
+ "winapi-util",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -972,6 +989,16 @@ name = "unicode-width"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
+
+[[package]]
+name = "walkdir"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
+dependencies = [
+ "same-file",
+ "winapi-util",
+]
 
 [[package]]
 name = "wasi"

@@ -33,7 +33,7 @@ struct CanonPair {
 
 // JSON input/output shape: Vec<Graph>, Graph = Vec<Edge>, Edge = [u, v]
 #[derive(Serialize, Deserialize)]
-struct EdgePair(pub i64, pub i64);
+struct EdgePair(pub usize, pub usize);
 
 // ---- Utilities -----------------------------------------------------------------
 // 必ず小さい方が前に来るように正規化
@@ -130,10 +130,10 @@ fn canon_label_bb_with_markers(
 
 fn build_sig_pool_from_bipartite(
     k_left: usize,
-    edges_ab: &[(usize, i64)],
+    edges_ab: &[(usize, usize)],
 ) -> HashMap<u32, usize> {
     // B id -> signature
-    let mut sig_of_b: HashMap<i64, u32> = HashMap::new();
+    let mut sig_of_b: HashMap<usize, u32> = HashMap::new();
     for &(a, b) in edges_ab {
         assert!(a < k_left, "A-side index {a} is out of range 0..{}", k_left - 1);
         let entry = sig_of_b.entry(b).or_insert(0);
@@ -462,12 +462,12 @@ fn enumerate_union_internal_graphs_orbits_unified(
 // ---- Assemble full graph in original labels -----------------------------------
 
 fn assemble_full_graph_complete(
-    a_labels: &[i64],                 // e.g., [1,2,3,4]
+    a_labels: &[usize],                 // e.g., [1,2,3,4]
     canon_edges_bb: &[(usize, usize)],
     canon_colors_b: &[u32],
     total_sig_pool: &HashMap<u32, usize>,
-    b_ids_sorted: &[i64],
-) -> (Vec<(i64, i64)>, Vec<i64>) {
+    b_ids_sorted: &[usize],
+) -> (Vec<(usize, usize)>, Vec<usize>) {
     let m_active = canon_colors_b.len();
     let mut used: HashMap<u32, usize> = HashMap::new();
     for &sig in canon_colors_b { *used.entry(sig).or_insert(0) += 1; }
@@ -489,18 +489,18 @@ fn assemble_full_graph_complete(
     let m_total = m_active + m_remain;
 
     // Extend B label list if needed
-    let mut b_ids_extended: Vec<i64> = b_ids_sorted.to_vec();
+    let mut b_ids_extended: Vec<usize> = b_ids_sorted.to_vec();
     if m_total > b_ids_extended.len() {
         let start = if b_ids_extended.is_empty() { 1 } else { b_ids_extended.iter().copied().max().unwrap() + 1 };
-        let need = (m_total - b_ids_extended.len()) as i64;
+        let need = (m_total - b_ids_extended.len()) as usize;
         for i in 0..need { b_ids_extended.push(start + i); }
     }
 
     // Map temporary indices 0..m_total-1 to real labels
-    let mut b_map: HashMap<usize, i64> = HashMap::new();
+    let mut b_map: HashMap<usize, usize> = HashMap::new();
     for i in 0..m_total { b_map.insert(i, b_ids_extended[i]); }
 
-    let mut edges_full: Vec<(i64, i64)> = Vec::new();
+    let mut edges_full: Vec<(usize, usize)> = Vec::new();
 
     // A–B for active B
     for (b_idx, &sig) in canon_colors_b.iter().enumerate() {
@@ -544,19 +544,19 @@ fn assemble_full_graph_complete(
 
 // ---- Global canonicalization (marker gadgets; A by degree class; B mono) ----
 fn canon_label_whole_with_markers(
-    a_labels: &[i64],
-    b_ids_extended: &[i64],
-    edges_full_int: &[(i64, i64)],
+    a_labels: &[usize],
+    b_ids_extended: &[usize],
+    edges_full_int: &[(usize, usize)],
 ) -> CanonLabeling {
     // 収録ノードを列挙
-    let mut nodes_set: BTreeSet<i64> = BTreeSet::new();
+    let mut nodes_set: BTreeSet<usize> = BTreeSet::new();
     for &(u, v) in edges_full_int { nodes_set.insert(u); nodes_set.insert(v); }
-    let nodes: Vec<i64> = nodes_set.into_iter().collect();
+    let nodes: Vec<usize> = nodes_set.into_iter().collect();
     let n = nodes.len();
 
     // 実ラベル -> petgraph ノード index
     let mut g: Graph<(), (), Undirected> = Graph::with_capacity(n + 4, edges_full_int.len() + n);
-    let mut idx: HashMap<i64, _> = HashMap::new();
+    let mut idx: HashMap<usize, _> = HashMap::new();
     for &v in &nodes {
         let nd = g.add_node(());
         idx.insert(v, nd);
@@ -570,7 +570,7 @@ fn canon_label_whole_with_markers(
     let a3_marker = g.add_node(());
     let b_marker  = g.add_node(());
 
-    let b_set: HashSet<i64> = b_ids_extended.iter().copied().collect();
+    let b_set: HashSet<usize> = b_ids_extended.iter().copied().collect();
     // A 側：度クラスごとにマーカーへ
     for &a in a_labels {
         if b_set.contains(&a) { continue; }
@@ -612,7 +612,7 @@ fn canon_label_whole_with_markers(
 struct Config {
     in_json_path: PathBuf,
     out_json_path: PathBuf,
-    a_labels: Vec<i64>,
+    a_labels: Vec<usize>,
     x_internal_edges: usize,
     maxdeg_total: i32,
 }
@@ -624,10 +624,10 @@ fn run_pipeline(cfg: &Config) -> Result<()> {
     let mut s = String::new();
     f.read_to_string(&mut s)?;
     // JSON の デシリアライズ
-    let graphs_in: Vec<Vec<[i64; 2]>> = serde_json::from_str(&s)
-        .with_context(|| "Failed to parse input JSON as Vec<Vec<[i64;2]>>")?;
+    let graphs_in: Vec<Vec<[usize; 2]>> = serde_json::from_str(&s)
+        .with_context(|| "Failed to parse input JSON as Vec<Vec<[usize;2]>>")?;
     // 結果用の Vector
-    let mut all_out_graphs: Vec<Vec<[i64; 2]>> = Vec::new();
+    let mut all_out_graphs: Vec<Vec<[usize; 2]>> = Vec::new();
     // 全体同型の去重複は CanonLabeling をキーに
     // TODO: CanonLabeling を使うので OK なのか？？
     let mut seen_global: HashSet<CanonLabeling> = HashSet::new();
@@ -637,15 +637,15 @@ fn run_pipeline(cfg: &Config) -> Result<()> {
 
     for edge_list in graphs_in {
         // 1) split A/B
-        let mut edges_ab: Vec<(usize, i64)> = Vec::new();
-        let mut b_ids: BTreeSet<i64> = BTreeSet::new();
+        let mut edges_ab: Vec<(usize, usize)> = Vec::new();
+        let mut b_ids: BTreeSet<usize> = BTreeSet::new();
         for e in edge_list {
             let (u, v) = (e[0], e[1]);
             let (a, b) = if u <= amax { (u, v) } else { (v, u) };
             edges_ab.push(((a - 1) as usize, b));
             b_ids.insert(b);
         }
-        let b_ids_sorted: Vec<i64> = b_ids.into_iter().collect();
+        let b_ids_sorted: Vec<usize> = b_ids.into_iter().collect();
 
         // 2) signature pool from bipartite
         let sig_pool = build_sig_pool_from_bipartite(k_left, &edges_ab);
@@ -665,7 +665,7 @@ fn run_pipeline(cfg: &Config) -> Result<()> {
             if !seen_global.insert(label) { continue; } // already seen
 
             // push in original JSON shape
-            let mut one_graph: Vec<[i64; 2]> = Vec::with_capacity(edges_full.len());
+            let mut one_graph: Vec<[usize; 2]> = Vec::with_capacity(edges_full.len());
             for (u, v) in edges_full { one_graph.push([u, v]); }
             all_out_graphs.push(one_graph);
         }
@@ -686,7 +686,7 @@ fn parse_args() -> Result<Config> {
     // Minimal ad-hoc parser to avoid extra deps
     let mut in_json_path = None;
     let mut out_json_path = None;
-    let mut a_labels: Vec<i64> = vec![1, 2, 3, 4];
+    let mut a_labels: Vec<usize> = vec![1, 2, 3, 4];
     let mut x_internal_edges: usize = INTERNAL_EDGES;
     let mut maxdeg_total: i32 = 4;
 
@@ -698,7 +698,7 @@ fn parse_args() -> Result<Config> {
             "--out" => { out_json_path = Some(PathBuf::from(args[i + 1].clone())); i += 2; }
             "--a-labels" => {
                 // comma-separated e.g. 1,2,3,4
-                let vals = args[i + 1].split(',').filter(|s| !s.is_empty()).map(|s| s.parse::<i64>().unwrap());
+                let vals = args[i + 1].split(',').filter(|s| !s.is_empty()).map(|s| s.parse::<usize>().unwrap());
                 a_labels = vals.collect();
                 i += 2;
             }
@@ -761,6 +761,41 @@ fn load_graphs_from_json(path: &Path) -> Result<Vec<UnGraphMap<usize, ()>>> {
             g.add_edge(u, v, ());
         }
         graphs.push(g);
+    }
+    Ok(graphs)
+}
+
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use anyhow::{Result, Context};
+use petgraph::graphmap::UnGraphMap;
+use graph6::Graph;
+
+/// graph6 形式から読み込み
+fn load_graphs_from_graph6(path: &std::path::Path) -> Result<Vec<UnGraphMap<usize, ()>>> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+
+    let mut graphs = Vec::new();
+    for line in reader.lines() {
+        let line = line?; // 1行1グラフ (graph6 の仕様)
+        if line.trim().is_empty() {
+            continue;
+        }
+        let g6 = Graph::from_graph6(&line)
+            .with_context(|| format!("failed to parse graph6 line: {}", line))?;
+        
+        // Graph6 → UnGraphMap に変換
+        let mut gmap = UnGraphMap::<usize, ()>::new();
+        for u in 0..g6.n() {
+            for v in (u+1)..g6.n() {
+                if g6.has_edge(u, v) {
+                    gmap.add_edge(u, v, ());
+                }
+            }
+        }
+        graphs.push(gmap);
     }
     Ok(graphs)
 }
@@ -853,6 +888,39 @@ fn main() -> Result<()> {
             });
         });
         // ← この for で“次の窓”に進むので、大崩れしない進行順序と高い並列度を両立
+    }
+
+    fs::create_dir_all(out_base)
+        .with_context(|| format!("create out base dir {}", out_base.display()))?;
+
+    // 入力ディレクトリ配下の *.json を列挙
+    let mut json_files = Vec::<PathBuf>::new();
+    for entry in WalkDir::new(out_base).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let p = entry.into_path();
+        if p.extension().and_then(|s| s.to_str()) == Some("json") {
+            json_files.push(p);
+        }
+    }
+    if json_files.is_empty() {
+        bail!("no JSON files under {}", in_base.display());
+    }
+
+    let total = json_files.len();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    // チャンクに分けて順次（各チャンクの中は並列）
+    for chunk in json_files.chunks(WINDOW) {
+        chunk.par_iter().for_each(|in_path| {
+            if let Err(e) = process_one(out_base, out_base, in_path) {
+                eprintln!("[err] {}: {:#}", in_path.display(), e);
+            }
+            let done = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let progress = (done as f64 / total as f64) * 100.0;
+            println!("[{done}/{total} | {progress:5.1}%] {}", in_path.display());
+        });
     }
 
     println!("all done in {:.3} 秒", start.elapsed().as_secs_f64());
